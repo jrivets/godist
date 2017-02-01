@@ -17,7 +17,6 @@ type ms_record struct {
 
 type mem_storage struct {
 	data   map[string]*ms_record
-	lock   sync.Mutex
 	procId ProcId
 }
 
@@ -46,6 +45,12 @@ func NewMemStorage() Storage {
 	return ms
 }
 
+func dropAll() {
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
+	mss = make([]*mem_storage, 0)
+}
+
 func newMemStorage(data map[string]*ms_record) *mem_storage {
 	return &mem_storage{data: data, procId: ProcId(uuid.NewV4().String())}
 }
@@ -55,10 +60,6 @@ func (ms *mem_storage) MyProcId() ProcId {
 }
 
 func (ms *mem_storage) IsValid(procId ProcId) bool {
-	if ms.procId == procId {
-		return true
-	}
-
 	mss_lock.Lock()
 	defer mss_lock.Unlock()
 
@@ -71,8 +72,8 @@ func (ms *mem_storage) IsValid(procId ProcId) bool {
 }
 
 func (ms *mem_storage) Create(ctx context.Context, record *Record) (*Record, error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	if r, ok := ms.data[record.Key]; ok {
 		return toRecord(r), Error(DLErrAlreadyExists)
@@ -89,8 +90,8 @@ func (ms *mem_storage) Create(ctx context.Context, record *Record) (*Record, err
 }
 
 func (ms *mem_storage) Get(ctx context.Context, key string) (*Record, error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	if r, ok := ms.data[key]; ok {
 		return toRecord(r), nil
@@ -100,8 +101,8 @@ func (ms *mem_storage) Get(ctx context.Context, key string) (*Record, error) {
 }
 
 func (ms *mem_storage) CasByVersion(ctx context.Context, record *Record) (*Record, error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	r, ok := ms.data[record.Key]
 	if !ok {
@@ -119,14 +120,14 @@ func (ms *mem_storage) CasByVersion(ctx context.Context, record *Record) (*Recor
 	r1 := to_ms_record(record)
 	r1.version = r.version + 1
 	r1.procId = r.procId
-	ms.data[r.key] = r
+	ms.data[r.key] = r1
 	r.notifyChans()
 	return toRecord(r1), nil
 }
 
 func (ms *mem_storage) Delete(ctx context.Context, record *Record) (*Record, error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	r, ok := ms.data[record.Key]
 	if !ok {
@@ -167,9 +168,30 @@ func (ms *mem_storage) WaitVersionChange(ctx context.Context, key string, versio
 	return ms.Get(ctx, key)
 }
 
+func (ms *mem_storage) Close() {
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
+
+	for k, v := range ms.data {
+		if v.procId == ms.procId {
+			delete(ms.data, k)
+			v.notifyChans()
+		}
+	}
+
+	for i, v := range mss {
+		if v == ms {
+			mss[i] = mss[len(mss)-1]
+			mss = mss[:len(mss)-1]
+		}
+	}
+
+	ms.procId = NIL_OWNER
+}
+
 func (ms *mem_storage) newChan(key string, version Version) (chan bool, error) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	r, ok := ms.data[key]
 	if !ok {
@@ -186,8 +208,8 @@ func (ms *mem_storage) newChan(key string, version Version) (chan bool, error) {
 }
 
 func (ms *mem_storage) dropChan(key string, ch chan bool) {
-	ms.lock.Lock()
-	defer ms.lock.Unlock()
+	mss_lock.Lock()
+	defer mss_lock.Unlock()
 
 	msr, _ := ms.data[key]
 	if msr == nil {

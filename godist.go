@@ -1,6 +1,7 @@
 package godist
 
 import (
+	"github.com/jrivets/gorivets"
 	"golang.org/x/net/context"
 )
 
@@ -124,4 +125,8 @@ func (e Error) Error() string {
 
 func NewSyncProvider(storage Storage) SyncProvider {
 	return &dlock_manager{storage: storage, llocks: make(map[string]*local_lock)}
+}
+
+func SetLogger(log gorivets.Logger) {
+	logger = log
 }

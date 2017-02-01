@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/jrivets/gorivets"
 	"golang.org/x/net/context"
 )
 
@@ -21,6 +22,8 @@ func (dl *dlock) Unlock() {
 	dl.dlm.unlockGlobal(dl.ctx, dl.name)
 }
 
+var logger gorivets.Logger = gorivets.NewNilLogger()
+
 type dlock_manager struct {
 	storage Storage
 	lock    sync.Mutex
@@ -28,14 +31,14 @@ type dlock_manager struct {
 }
 
 type local_lock struct {
-	sigChannel chan bool
-	counter    int
+	sigChannels []chan bool
 }
 
 func (dlm *dlock_manager) NewMutex(ctx context.Context, name string) Mutex {
 	dlm.lock.Lock()
 	defer dlm.lock.Unlock()
 
+	logger.Debug("New mutex - ", name)
 	return &dlock{name: name, dlm: dlm, ctx: ctx}
 }
 
@@ -50,6 +53,7 @@ func (dlm *dlock_manager) lockGlobal(ctx context.Context, name string) error {
 		r, err := dlm.storage.Create(ctx, &Record{name, string(myProcId), 0, myProcId})
 
 		if err == nil {
+			logger.Debug("lockGlobal(): ", name, " OK")
 			return nil
 		}
 
@@ -82,72 +86,76 @@ func (dlm *dlock_manager) unlockGlobal(ctx context.Context, name string) {
 }
 
 func (dlm *dlock_manager) lockLocal(ctx context.Context, name string) error {
-	ll, err := dlm.leaseLocalLock(name)
-	if err != nil {
-		return err
-	}
+	logger.Debug("lockLocal(): ", name)
+	ch := dlm.leaseLocalLock(name)
 
-	if ll.counter == 1 {
+	if ch == nil {
+		logger.Debug("lockLocal(): ", name, " OK")
 		return nil
 	}
 
-	err = nil
+	var err error = nil
 	select {
-	case _, ok := <-ll.sigChannel:
-		if !ok {
-			err = error(DLErrClosed)
-		}
+	case <-ch:
+		logger.Debug("lockLocal(): ", name, " received wakeup notification")
 	case <-ctx.Done():
-		err = error(DLErrClosed)
-	}
-
-	if err != nil {
-		dlm.releaseLocalLock(name, ll)
+		logger.Debug("lockLocal(): ", name, " context closed")
+		dlm.releaseLocalLock(name, ch)
+		err = Error(DLErrClosed)
 	}
 
 	return err
 }
 
-func (dlm *dlock_manager) leaseLocalLock(name string) (*local_lock, error) {
+func (dlm *dlock_manager) leaseLocalLock(name string) <-chan bool {
 	dlm.lock.Lock()
 	defer dlm.lock.Unlock()
 
 	ll := dlm.llocks[name]
 	if ll == nil {
-		ll = &local_lock{counter: 0, sigChannel: make(chan bool)}
+		ll = &local_lock{make([]chan bool, 0)}
 		dlm.llocks[name] = ll
+		return nil
 	}
-	ll.counter++
+	ch := make(chan bool)
+	ll.sigChannels = append(ll.sigChannels, ch)
 
-	return ll, nil
+	return ch
 }
 
-func (dlm *dlock_manager) releaseLocalLock(name string, ll *local_lock) {
+func (dlm *dlock_manager) releaseLocalLock(name string, ch <-chan bool) {
 	dlm.lock.Lock()
 	defer dlm.lock.Unlock()
 
-	dlm.unlockLocalUnsafe(name, ll, false)
+	ll := dlm.llocks[name]
+	for i, c := range ll.sigChannels {
+		if c == ch {
+			lastIdx := len(ll.sigChannels) - 1
+			ll.sigChannels[i] = ll.sigChannels[lastIdx]
+			ll.sigChannels = ll.sigChannels[:lastIdx]
+			return
+		}
+	}
+
+	// we holded channel, but could not find it is in the list. It means
+	// that it was closed when we did not try to read out of there. Give the next
+	// waiter a chance to execute then
+	dlm.kickLocalWaiter(name, ll)
 }
 
 func (dlm *dlock_manager) unlockLocal(name string) {
 	dlm.lock.Lock()
 	defer dlm.lock.Unlock()
 
-	ll := dlm.llocks[name]
-	if ll == nil {
-		return
-	}
-
-	dlm.unlockLocalUnsafe(name, ll, true)
+	dlm.kickLocalWaiter(name, dlm.llocks[name])
 }
 
-func (dlm *dlock_manager) unlockLocalUnsafe(name string, ll *local_lock, signal bool) {
-	ll.counter--
-	if ll.counter == 0 {
+func (dlm *dlock_manager) kickLocalWaiter(name string, ll *local_lock) {
+	if len(ll.sigChannels) == 0 {
 		delete(dlm.llocks, name)
-	}
-
-	if signal && ll.counter > 0 {
-		ll.sigChannel <- true
+	} else {
+		ch := ll.sigChannels[0]
+		ll.sigChannels = ll.sigChannels[1:]
+		close(ch)
 	}
 }
