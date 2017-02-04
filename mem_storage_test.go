@@ -12,9 +12,9 @@ func TestOpenClose(t *testing.T) {
 	ms := NewMemStorage().(*mem_storage)
 	ms1 := NewMemStorage().(*mem_storage)
 
-	ms.Create(context.TODO(), &Record{"k", "v1", 0, ms.MyProcId()})
-	ms1.Create(context.TODO(), &Record{"k1", "v1", 0, ms1.MyProcId()})
-	ms1.Create(context.TODO(), &Record{"k2", "v1", 0, NIL_OWNER})
+	ms.Create(context.TODO(), &Record{"k", "v1", 0, ms.GetProcessLeaseId()})
+	ms1.Create(context.TODO(), &Record{"k1", "v1", 0, ms1.GetProcessLeaseId()})
+	ms1.Create(context.TODO(), &Record{"k2", "v1", 0, NO_LEASE_ID})
 
 	if len(mss) != 2 {
 		t.Fatal("2 ms instances should be created")
@@ -24,7 +24,7 @@ func TestOpenClose(t *testing.T) {
 	}
 
 	ms.Close()
-	if ms.IsValid(ms.MyProcId()) || !ms.IsValid(ms1.MyProcId()) {
+	if ms.IsValidLeaseId(ms.GetProcessLeaseId()) || !ms.IsValidLeaseId(ms1.GetProcessLeaseId()) {
 		t.Fatal("ms1 should be valid, but ms is invalid")
 	}
 	if len(mss) != 1 {
@@ -49,7 +49,7 @@ func TestOpenClose(t *testing.T) {
 func TestCreateGet(t *testing.T) {
 	dropAll()
 	ms := NewMemStorage().(*mem_storage)
-	r0 := &Record{"K", "v1", 10, NIL_OWNER}
+	r0 := &Record{"K", "v1", 10, NO_LEASE_ID}
 	ms.Create(context.TODO(), r0)
 	if len(ms.data) != 1 {
 		t.Fatal("*ms must contain one element")
@@ -74,7 +74,7 @@ func TestCreateGet(t *testing.T) {
 func TestImmutableGet(t *testing.T) {
 	dropAll()
 	ms := NewMemStorage().(*mem_storage)
-	r0 := &Record{"K", "v1", 10, NIL_OWNER}
+	r0 := &Record{"K", "v1", 10, NO_LEASE_ID}
 	r, _ := ms.Create(context.TODO(), r0)
 	if len(ms.data) != 1 {
 		t.Fatal("*ms must contain one element")
@@ -96,7 +96,7 @@ func TestImmutableGet(t *testing.T) {
 func TestCasByVersion(t *testing.T) {
 	dropAll()
 	ms := NewMemStorage().(*mem_storage)
-	r0 := &Record{"K", "v1", 10, NIL_OWNER}
+	r0 := &Record{"K", "v1", 10, NO_LEASE_ID}
 	r, err := ms.Create(context.TODO(), r0)
 	if err != nil {
 		t.Fatal("K must be created, but err=", err)
@@ -125,14 +125,19 @@ func TestCasByVersion(t *testing.T) {
 	ms.Close()
 }
 
-func TestWaitVersionChange(t *testing.T) {
+func TestWaitForVersionChange(t *testing.T) {
 	dropAll()
 	ms := NewMemStorage().(*mem_storage)
 	ms1 := NewMemStorage().(*mem_storage)
-	r0 := &Record{"K", "v1", 10, NIL_OWNER}
+	r0 := &Record{"K", "v1", 10, NO_LEASE_ID}
 	r, _ := ms.Create(context.TODO(), r0)
 
-	go func() {
+	rxx, err := ms.WaitForVersionChange(context.TODO(), "Kfff", 234)
+	if rxx != nil || !CheckError(err, DLErrNotFound) {
+		t.Fatal("(nil, DLErrNotFound) is expected")
+	}
+
+	go func(r *Record) {
 		// be sure we reached WaitVersion
 		msr := ms.data["K"]
 		for len(msr.waitChs) == 0 {
@@ -141,14 +146,14 @@ func TestWaitVersionChange(t *testing.T) {
 
 		r.Value = "val2"
 		ms1.CasByVersion(context.TODO(), r)
-	}()
+	}(r)
 
-	r, _ = ms.WaitVersionChange(context.TODO(), "K", r.Version)
+	r, _ = ms.WaitForVersionChange(context.TODO(), "K", r.Version)
 	if r.Value != "val2" || r.Version != 2 {
 		t.Fatal("Expecting updated version and value")
 	}
 
-	_, err := ms.WaitVersionChange(context.TODO(), "K", r.Version-1)
+	_, err = ms.WaitForVersionChange(context.TODO(), "K", r.Version-1)
 	if !CheckError(err, DLErrWrongVersion) {
 		t.Fatal("Expecting DLErrWrongVersion")
 	}
@@ -166,25 +171,25 @@ func TestWaitVersionChange(t *testing.T) {
 		ms1.Delete(context.TODO(), r)
 	}()
 
-	r, err = ms.WaitVersionChange(context.TODO(), "K", r.Version)
-	if r != nil || !CheckError(err, DLErrNotFound) {
-		t.Fatal("The value is deleted, why not nil?")
+	r, err = ms.WaitForVersionChange(context.TODO(), "K", r.Version)
+	if r != nil || err != nil {
+		t.Fatal("The value is deleted, why not (nil, nil)?")
 	}
 
 	ms.Close()
 	ms1.Close()
 
-	_, err = ms.WaitVersionChange(context.TODO(), "K", 123452345)
+	_, err = ms.WaitForVersionChange(context.TODO(), "K", 123452345)
 	if !CheckError(err, DLErrNotFound) {
 		t.Fatal("Expecting DLErrNotFound")
 	}
 
 }
 
-func TestWaitVersionChange2(t *testing.T) {
+func TestWaitForVersionChange2(t *testing.T) {
 	dropAll()
 	ms := NewMemStorage().(*mem_storage)
-	r0 := &Record{"K", "v1", 10, NIL_OWNER}
+	r0 := &Record{"K", "v1", 10, NO_LEASE_ID}
 	r, _ := ms.Create(context.TODO(), r0)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -195,7 +200,7 @@ func TestWaitVersionChange2(t *testing.T) {
 		ms.CasByVersion(context.TODO(), r)
 	}(r)
 
-	r, err := ms.WaitVersionChange(ctx, "K", r.Version)
+	r, err := ms.WaitForVersionChange(ctx, "K", r.Version)
 	if !CheckError(err, DLErrClosed) {
 		t.Fatal("Expecting Closed channel but err=", err)
 	}

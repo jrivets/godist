@@ -163,12 +163,12 @@ func TestManyLockalLocking(t *testing.T) {
 	var lock sync.Mutex
 	lock.Lock()
 
-	mxs := make([]Mutex, 0)
+	mxs := make([]Locker, 0)
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		lck := dlm.NewMutex(context.TODO(), "val")
 		mxs = append(mxs, lck)
-		go func(l Mutex) {
+		go func(l Locker) {
 			err := l.Lock()
 			if err != nil {
 				t.Fatal("Must not error!")
@@ -210,12 +210,12 @@ func TestManyCancelCtx(t *testing.T) {
 	var lock sync.Mutex
 	failed := 0
 	good := 0
-	mxs := make([]Mutex, 0)
+	mxs := make([]Locker, 0)
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		lck := dlm.NewMutex(ctx, "val")
 		mxs = append(mxs, lck)
-		go func(l Mutex) {
+		go func(l Locker) {
 			defer wg.Done()
 
 			err := l.Lock()

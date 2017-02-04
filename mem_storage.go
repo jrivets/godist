@@ -11,13 +11,13 @@ type ms_record struct {
 	key     string
 	value   string
 	version Version
-	procId  ProcId
+	leaseId LeaseId
 	waitChs []chan bool
 }
 
 type mem_storage struct {
-	data   map[string]*ms_record
-	procId ProcId
+	data    map[string]*ms_record
+	leaseId LeaseId
 }
 
 var (
@@ -25,7 +25,7 @@ var (
 	mss_lock sync.Mutex
 )
 
-func NewMemStorage() Storage {
+func NewMemStorage() StorageConnector {
 	mss_lock.Lock()
 	defer mss_lock.Unlock()
 
@@ -52,19 +52,19 @@ func dropAll() {
 }
 
 func newMemStorage(data map[string]*ms_record) *mem_storage {
-	return &mem_storage{data: data, procId: ProcId(uuid.NewV4().String())}
+	return &mem_storage{data: data, leaseId: LeaseId(uuid.NewV4().String())}
 }
 
-func (ms *mem_storage) MyProcId() ProcId {
-	return ms.procId
+func (ms *mem_storage) GetProcessLeaseId() LeaseId {
+	return ms.leaseId
 }
 
-func (ms *mem_storage) IsValid(procId ProcId) bool {
+func (ms *mem_storage) IsValidLeaseId(leaseId LeaseId) bool {
 	mss_lock.Lock()
 	defer mss_lock.Unlock()
 
 	for _, ms1 := range mss {
-		if ms1.procId == procId {
+		if ms1.leaseId == leaseId {
 			return true
 		}
 	}
@@ -79,8 +79,8 @@ func (ms *mem_storage) Create(ctx context.Context, record *Record) (*Record, err
 		return toRecord(r), Error(DLErrAlreadyExists)
 	}
 
-	if record.Owner != NIL_OWNER && record.Owner != ms.procId {
-		panic("Incorrect usage: record.Owner=" + record.Owner + " should be NIL_OWNER or " + ms.procId)
+	if record.Lease != NO_LEASE_ID && record.Lease != ms.leaseId {
+		panic("Incorrect usage: record.Owner=" + record.Lease + " should be NIL_OWNER or " + ms.leaseId)
 	}
 
 	r := to_ms_record(record)
@@ -109,8 +109,8 @@ func (ms *mem_storage) CasByVersion(ctx context.Context, record *Record) (*Recor
 		return nil, Error(DLErrNotFound)
 	}
 
-	if record.Owner != NIL_OWNER && record.Owner != ms.procId {
-		panic("Incorrect usage: record.Owner=" + record.Owner + " should be NIL_OWNER or " + ms.procId)
+	if record.Lease != r.leaseId {
+		return toRecord(r), Error(DLErrWrongLeaseId)
 	}
 
 	if r.version != record.Version {
@@ -119,7 +119,7 @@ func (ms *mem_storage) CasByVersion(ctx context.Context, record *Record) (*Recor
 
 	r1 := to_ms_record(record)
 	r1.version = r.version + 1
-	r1.procId = r.procId
+	r1.leaseId = r.leaseId
 	ms.data[r.key] = r1
 	r.notifyChans()
 	return toRecord(r1), nil
@@ -143,15 +143,12 @@ func (ms *mem_storage) Delete(ctx context.Context, record *Record) (*Record, err
 	return nil, nil
 }
 
-func (ms *mem_storage) WaitVersionChange(ctx context.Context, key string, version Version) (*Record, error) {
+func (ms *mem_storage) WaitForVersionChange(ctx context.Context, key string, version Version) (*Record, error) {
 	ch, err := ms.newChan(key, version)
 	if err != nil {
 		r, _ := ms.Get(ctx, key)
 		return r, err
 	}
-
-	// will do this after ms.dropChan() (see below), what guarantees no write after the call
-	defer close(ch)
 
 	err = nil
 	select {
@@ -165,7 +162,12 @@ func (ms *mem_storage) WaitVersionChange(ctx context.Context, key string, versio
 		return nil, err
 	}
 
-	return ms.Get(ctx, key)
+	r, err := ms.Get(ctx, key)
+	if CheckError(err, DLErrNotFound) {
+		return nil, nil
+	}
+
+	return r, err
 }
 
 func (ms *mem_storage) Close() {
@@ -173,7 +175,7 @@ func (ms *mem_storage) Close() {
 	defer mss_lock.Unlock()
 
 	for k, v := range ms.data {
-		if v.procId == ms.procId {
+		if v.leaseId == ms.leaseId {
 			delete(ms.data, k)
 			v.notifyChans()
 		}
@@ -186,7 +188,7 @@ func (ms *mem_storage) Close() {
 		}
 	}
 
-	ms.procId = NIL_OWNER
+	ms.leaseId = NO_LEASE_ID
 }
 
 func (ms *mem_storage) newChan(key string, version Version) (chan bool, error) {
@@ -202,7 +204,7 @@ func (ms *mem_storage) newChan(key string, version Version) (chan bool, error) {
 		return nil, Error(DLErrWrongVersion)
 	}
 
-	ch := make(chan bool, 1)
+	ch := make(chan bool)
 	r.waitChs = append(r.waitChs, ch)
 	return ch, nil
 }
@@ -221,6 +223,7 @@ func (ms *mem_storage) dropChan(key string, ch chan bool) {
 			l := len(msr.waitChs)
 			msr.waitChs[l-1], msr.waitChs[i] = msr.waitChs[i], msr.waitChs[l-1]
 			msr.waitChs = msr.waitChs[:l-1]
+			close(ch)
 			return
 		}
 	}
@@ -228,15 +231,15 @@ func (ms *mem_storage) dropChan(key string, ch chan bool) {
 
 func (msr *ms_record) notifyChans() {
 	for _, ch := range msr.waitChs {
-		ch <- true
+		close(ch)
 	}
 	msr.waitChs = make([]chan bool, 0)
 }
 
 func toRecord(r *ms_record) *Record {
-	return &Record{Key: r.key, Value: r.value, Version: r.version, Owner: r.procId}
+	return &Record{Key: r.key, Value: r.value, Version: r.version, Lease: r.leaseId}
 }
 
 func to_ms_record(r *Record) *ms_record {
-	return &ms_record{r.Key, r.Value, r.Version, r.Owner, make([]chan bool, 0)}
+	return &ms_record{r.Key, r.Value, r.Version, r.Lease, make([]chan bool, 0)}
 }

@@ -22,10 +22,10 @@ func (dl *dlock) Unlock() {
 	dl.dlm.unlockGlobal(dl.ctx, dl.name)
 }
 
-var logger gorivets.Logger = gorivets.NewNilLogger()
+var logger gorivets.Logger = gorivets.NewNilLoggerProvider()("pff")
 
 type dlock_manager struct {
-	storage Storage
+	storage StorageConnector
 	lock    sync.Mutex
 	llocks  map[string]*local_lock
 }
@@ -34,7 +34,7 @@ type local_lock struct {
 	sigChannels []chan bool
 }
 
-func (dlm *dlock_manager) NewMutex(ctx context.Context, name string) Mutex {
+func (dlm *dlock_manager) NewMutex(ctx context.Context, name string) Locker {
 	dlm.lock.Lock()
 	defer dlm.lock.Unlock()
 
@@ -48,9 +48,9 @@ func (dlm *dlock_manager) lockGlobal(ctx context.Context, name string) error {
 		return err
 	}
 
-	myProcId := dlm.storage.MyProcId()
+	leaseId := dlm.storage.GetProcessLeaseId()
 	for {
-		r, err := dlm.storage.Create(ctx, &Record{name, string(myProcId), 0, myProcId})
+		r, err := dlm.storage.Create(ctx, &Record{name, string(leaseId), 0, leaseId})
 
 		if err == nil {
 			logger.Debug("lockGlobal(): ", name, " OK")
@@ -62,7 +62,7 @@ func (dlm *dlock_manager) lockGlobal(ctx context.Context, name string) error {
 			return err
 		}
 
-		r, err = dlm.storage.WaitVersionChange(ctx, name, r.Version)
+		r, err = dlm.storage.WaitForVersionChange(ctx, name, r.Version)
 		if !CheckError(err, DLErrNotFound) && err != nil {
 			dlm.unlockLocal(name)
 			return err
@@ -74,11 +74,12 @@ func (dlm *dlock_manager) unlockGlobal(ctx context.Context, name string) {
 	defer dlm.unlockLocal(name)
 	r, err := dlm.storage.Get(ctx, name)
 
+	procLeaseId := dlm.storage.GetProcessLeaseId()
 	for r != nil && !CheckError(err, DLErrNotFound) {
-		if r.Owner != dlm.storage.MyProcId() {
+		if r.Lease != procLeaseId {
 			panic(errors.New("FATAL internal error: unlocking object which is locked by other locker. " +
-				"expected owner=" + string(dlm.storage.MyProcId()) +
-				", but returned one is " + string(r.Owner)))
+				"expected owner=" + string(procLeaseId) +
+				", but returned one is " + string(r.Lease)))
 		}
 
 		r, err = dlm.storage.Delete(ctx, r)

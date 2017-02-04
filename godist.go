@@ -8,83 +8,109 @@ import (
 type (
 	Version int64
 
-	// ProcId identifies a process in the distributed system. It is the
-	// storage responsibility to maintain the value unique (see the Storage interface)
-	// and guarantee there is no 2 storage instances with same identifier in
-	// the distributed system.
-	ProcId string
+	// LeaseId is a record lease identifier. Every record in the
+	// storage can have a lease id or has NO_LEASE_ID. Records that have a lease
+	// will be automatically deleted if the lease is expired. Lease scope
+	// is a time-frame when the lease is valid.
+	LeaseId string
 
-	// A Storage record
-	Record struct {
-		Key     string
-		Value   string
-		Version Version
+	// LeaseProvider an interface which allows to manage leasese in conjuction
+	// with the StorageConnector
+	LeaseProvider interface {
 
-		// Identifies a process which owns the record. If the value is not empty
-		// (Owner != NIL_OWNER), the record is owned by the process id, and as
-		// soon as the process is over or dies, the record can be automatically
-		// deleted from the storage because it is not owned anymore.
-		//
-		// Records with NIL_OWNER should be deleted explicitly. The value
-		// Can be set only when the record is created.
-		Owner ProcId
+		// Returns the process lease Id. Returned value is always same for the
+		// same process and it is considered invalid as soon as the process is
+		// over. Based on implementation details, in case of the current
+		// process is crashed brutally, its lease Id can be reported to others
+		// as valid for some period of time.
+		GetProcessLeaseId() LeaseId
+
+		// Returns true if the lease Id is valid.
+		IsValidLeaseId(leaseId LeaseId) bool
 	}
 
-	// The Storage interface defines some operations over the record storage.
-	// The record storage allows to keep key-value pairs in the distributed
-	// system and supports a set of operations that allow to implement some
-	// synchronization distributed objects
-	Storage interface {
+	// A record that can be stroed in distributed storage
+	Record struct {
+		Key   string
+		Value string
 
-		// Returns the process unique identifier for the storage object.
-		// It is the storage implementation responsibility to keep and support
-		// the ProcId uniqueness. When the process is over or storage is closed
-		// the implementation guarantees that all records with the ProcId will
-		// be deleted or diregarded soon.
-		MyProcId() ProcId
+		// A version that identifies the record. It is managed by storage
+		Version Version
 
-		// Returns whether provided procId is valid or not
-		IsValid(procId ProcId) bool
+		// The record lease. If the value is not empty
+		// (Lease != NO_LEASE_ID), the record availability is defined by the
+		// lease scope. As soon as the lease becomes invalid, the record is
+		// Removed from the storage permanently
+		//
+		// Records with NO_LEASE_ID should be deleted explicitly. The value
+		// Can be set only when the record is created and cannot be changed
+		// during updates.
+		Lease LeaseId
+	}
 
-		// Creates a new one, or returns existing one with DLErrAlreadyExists
-		// error.
+	// The StorageConnector interface defines some operations over the record storage.
+	// The record storage allows to keep key-value pairs, and supports a set
+	// of operations that allow to implement some distributed primitives
+	StorageConnector interface {
+		LeaseProvider
+
+		// Creates a new record in the storage. It returns existing record with
+		// DLErrAlreadyExists error if it already exists in the storage
 		Create(ctx context.Context, record *Record) (*Record, error)
 
 		// Retrieves the record by its key. It will return nil and an error,
 		// which will indicate the reason why the operation was not succesful.
 		Get(ctx context.Context, key string) (*Record, error)
 
-		// Compare and set the record value if the record stored version is
+		// Compare-and-set the record Value if the record stored version is
 		// same as in the provided record. The record version will be updated
 		// too.
 		//
-		// Returns updated stored record or stored record and error if the
-		// operation was not successful
+		// Returns updated stored record or stored record together with an error
+		// if the operation was not successful
 		CasByVersion(ctx context.Context, record *Record) (*Record, error)
 
 		// Tries to delete the record. Operation can fail if stored record
-		// version is different than existing one. This case the stored version
+		// version is different than existing one. This case the stored record
 		// is returned as well as the appropriate error. If the record is deleted
-		// both results are nil(!)
+		// both results will be nil (!)
 		Delete(ctx context.Context, record *Record) (*Record, error)
 
 		// Waits for the record version change. The version param contans an
-		// expected version.
-		WaitVersionChange(ctx context.Context, key string, version Version) (*Record, error)
+		// expected record version. The call returns immediately if the record
+		// is not found (DLErrNotFound will be reported), or the record version
+		// is different than expected (no error this case is returned). Otherwise
+		// the call will be blocked until one of the following things happens:
+		// - context is done
+		// - the record version is changed
+		// - the record is deleted
+		// Updated version of the record will be deleted together with error=nil
+		// If the record is deleted (nil, nil) is returned
+		WaitForVersionChange(ctx context.Context, key string, version Version) (*Record, error)
 	}
 
+	// Errors that can be returned by the package
 	Error int
 
-	Mutex interface {
-		// Locks the mutex or return error if it is not possible.
-		// The method is panicing with incorrect usage (a second attempt to lock
-		// the same mutex object without unlocking it
+	// Returns a locker for distributed lock.
+	Locker interface {
+
+		// Locks the object or returns an error if it is not possible.
+		// If error is not nil, then the lock operation considered failed.
 		Lock() error
+
+		// Unlocks the object. Behavior can be different for different primitives
 		Unlock()
 	}
 
 	SyncProvider interface {
-		NewMutex(ctx context.Context, name string) Mutex
+
+		// Returns the distributed mutex by its "name". The following rules are
+		// applied:
+		// - Different Lockers for the same name address same distributed mutex.
+		// - Only one go-routine in the distributed system can lock the mutex in a raise.
+		// - Any go-routine of the process which locked the mutex can unlock it.
+		NewMutex(ctx context.Context, name string) Locker
 	}
 )
 
@@ -94,8 +120,9 @@ const (
 	DLErrNotFound      Error = 2
 	DLErrWrongVersion  Error = 3
 	DLErrClosed        Error = 4
+	DLErrWrongLeaseId  Error = 5
 
-	NIL_OWNER = ""
+	NO_LEASE_ID = ""
 )
 
 func CheckError(e error, expErr Error) bool {
@@ -118,12 +145,14 @@ func (e Error) Error() string {
 	case DLErrWrongVersion:
 		return "Unexpected record version"
 	case DLErrClosed:
-		return "The Distributed Lock Manager is already closed."
+		return "The Context is done or storage is closed if supported"
+	case DLErrWrongLeaseId:
+		return "Unexpected lease Id"
 	}
 	return ""
 }
 
-func NewSyncProvider(storage Storage) SyncProvider {
+func NewSyncProvider(storage StorageConnector) SyncProvider {
 	return &dlock_manager{storage: storage, llocks: make(map[string]*local_lock)}
 }
 
